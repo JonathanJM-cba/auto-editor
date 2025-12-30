@@ -1,4 +1,7 @@
-import std/posix
+when not defined(windows):
+  import std/posix
+else:
+  const EAGAIN* = 11 # Standard value, but check if used
 
 type
   VaList* {.importc: "va_list", header: "<stdarg.h>", bycopy.} = object

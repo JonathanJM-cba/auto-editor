@@ -30,7 +30,12 @@ task test, "Run unit tests":
   exec &"nim c {flags} -r tests/unit"
 
 task make, "Export the project":
-  exec &"nim c -d:danger --panics:on {flags} --passC:-flto --passL:-flto --out:auto-editor src/main.nim"
+  var extraFlags = ""
+  when not defined(windows):
+    extraFlags = "--passC:-flto --passL:-flto "
+  else:
+    extraFlags = "--passL:-static "
+  exec &"nim c -d:danger --panics:on {flags} {extraFlags}--out:auto-editor src/main.nim"
   when defined(macosx):
     exec "strip -ur auto-editor"
     exec "stat -f \"%z bytes\" ./auto-editor"
@@ -112,7 +117,7 @@ let lame = Package(
   name: "lame",
   sourceUrl: "http://deb.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz",
   sha256: "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e",
-  buildArguments: @["--disable-frontend", "--disable-decoder", "--disable-gtktest", "--disable-dependency-tracking"],
+  buildArguments: @["--disable-frontend", "--disable-gtktest", "--disable-dependency-tracking", "--disable-shared"],
   ffFlag: "--enable-libmp3lame",
 )
 let opus = Package(
@@ -220,14 +225,30 @@ func dirName(package: Package): string =
 
 
 proc getFileHash(filename: string): string =
-  let (existsOutput, existsCode) = gorgeEx("test -f " & filename)
-  if existsCode != 0:
-    raise newException(IOError, "File does not exist: " & filename)
+  let path = absolutePath(filename)
+  if not fileExists(path):
+    raise newException(IOError, "File does not exist: " & path)
 
-  let (output, exitCode) = gorgeEx("shasum -a 256 " & filename)
-  if exitCode != 0:
-    raise newException(IOError, "Cannot hash file: " & filename)
-  return output.split()[0]
+  when defined(windows):
+    # Try CertUtil first
+    let (output, exitCode) = gorgeEx("certutil -hashfile \"" & path & "\" SHA256")
+    if exitCode == 0:
+      for line in output.splitLines():
+        let clean = line.strip().replace(" ", "")
+        if clean.len == 64 and clean.allCharsInSet(HexDigits):
+          return clean.toLowerAscii()
+    
+    # Try Git Bash sha256sum if CertUtil failed or misbehaved
+    let (output2, exitCode2) = gorgeEx("sh -lc \"sha256sum '" & path.replace("\\", "/") & "'\"")
+    if exitCode2 == 0:
+      return output2.split()[0]
+
+    raise newException(IOError, "Cannot hash file: " & path & "\n" & output)
+  else:
+    let (output, exitCode) = gorgeEx("shasum -a 256 " & filename)
+    if exitCode != 0:
+      raise newException(IOError, "Cannot hash file: " & filename)
+    return output.split()[0]
 
 proc checkHash(package: Package, filename: string) =
   let hash = getFileHash(filename)
@@ -237,14 +258,50 @@ proc checkHash(package: Package, filename: string) =
     quit(1)
 
 
-proc makeInstall() =
-  when defined(macosx):
-    exec "make -j$(sysctl -n hw.ncpu)"
-  elif defined(linux):
-    exec "make -j$(nproc)"
+proc toUnixPath(path: string): string =
+  result = path.replace("\\", "/")
+  # Keep C:/ style as it's more compatible across tools
+
+proc getMake(): string =
+  when defined(windows):
+    let (_, code) = gorgeEx("make --version")
+    if code == 0: return "make"
+    let (_, code2) = gorgeEx("mingw32-make --version")
+    if code2 == 0: return "mingw32-make"
+    echo "Warning: No make tool found (make or mingw32-make)."
+    return "make" # Fallback
   else:
-    exec "make -j4"
-  exec "make install"
+    return "make"
+
+proc movePath(src, dst: string) =
+  # Try to be more robust on Windows/MSYS2 where locks or race conditions are common
+  for i in 0..4:
+    if i > 0:
+      echo &"Move failed, retrying in {i}s... ({i}/5)"
+      exec &"sh -c 'sleep {i}'"
+    
+    let (_, code) = gorgeEx(&"mv -f \"{src}\" \"{dst}\"")
+    if code == 0: return
+
+  # If mv failed, try cmd /c move on Windows as a fallback
+  when defined(windows):
+    let s = src.replace("/", "\\")
+    let d = dst.replace("/", "\\")
+    let (_, code) = gorgeEx(&"cmd /c move /Y \"{s}\" \"{d}\"")
+    if code == 0: return
+
+  # Final attempt with exec to show error if it still fails
+  exec &"mv -f \"{src}\" \"{dst}\""
+
+proc makeInstall() =
+  let make = getMake()
+  when defined(macosx):
+    exec &"{make} -j$(sysctl -n hw.ncpu)"
+  elif defined(linux):
+    exec &"{make} -j$(nproc)"
+  else:
+    exec &"{make} -j4"
+  exec &"{make} install"
 
 proc cmakeBuild(package: Package, buildPath: string, crossWindows: bool = false) =
   mkDir("build_cmake")
@@ -269,7 +326,8 @@ proc cmakeBuild(package: Package, buildPath: string, crossWindows: bool = false)
     let cmakeCmd = "cmake " & cmakeArgs.join(" ") & " .."
     echo "RUN: ", cmakeCmd
     exec cmakeCmd
-    makeInstall()
+    exec "cmake --build . -j4"
+    exec "cmake --install ."
 
   # Fix whisper.pc file to include correct library order and dependencies
   if package.name == "whisper":
@@ -280,7 +338,7 @@ proc cmakeBuild(package: Package, buildPath: string, crossWindows: bool = false)
       let dstFile = libDir / ("lib" & libFile)
       if fileExists(srcFile) and not fileExists(dstFile):
         echo &"Renaming {srcFile} to {dstFile}"
-        exec &"mv \"{srcFile}\" \"{dstFile}\""
+        movePath(srcFile, dstFile)
     
     let pcFile = buildPath / "lib/pkgconfig/whisper.pc"
     if fileExists(pcFile):
@@ -371,7 +429,7 @@ proc x265Build(buildPath: string, crossWindows: bool = false) =
     echo "RUN: ", cmake12Cmd
     exec cmake12Cmd
     exec "cmake --build 12bit"
-    exec "mv 12bit/libx265.a 12bit/libx265_main12.a"
+    movePath("12bit/libx265.a", "12bit/libx265_main12.a")
 
   # Build 10-bit version
   echo "Building x265 10-bit..."
@@ -381,7 +439,7 @@ proc x265Build(buildPath: string, crossWindows: bool = false) =
   echo "RUN: ", cmake10Cmd
   exec cmake10Cmd
   exec "cmake --build 10bit"
-  exec "mv 10bit/libx265.a 10bit/libx265_main10.a"
+  movePath("10bit/libx265.a", "10bit/libx265_main10.a")
 
   # Build 8-bit version with linked 10-bit and optionally 12-bit
   echo "Building x265 8-bit with multi-bit-depth support..."
@@ -429,17 +487,23 @@ proc x265Build(buildPath: string, crossWindows: bool = false) =
 
     # Create MRI script with paths relative to 8bit directory
     withDir "8bit":
-      exec "echo 'CREATE libx265_combined.a' > combine.mri"
-      exec "echo 'ADDLIB libx265.a' >> combine.mri"
-      exec "echo 'ADDLIB libx265_main10.a' >> combine.mri"
+      var mri = "CREATE libx265_combined.a\n"
+      mri &= "ADDLIB libx265.a\n"
+      mri &= "ADDLIB libx265_main10.a\n"
       if enable12bit:
-        exec "echo 'ADDLIB libx265_main12.a' >> combine.mri"
-      exec "echo 'SAVE' >> combine.mri"
-      exec "echo 'END' >> combine.mri"
-      exec &"{arCommand} -M < combine.mri"
+        mri &= "ADDLIB libx265_main12.a\n"
+      mri &= "SAVE\n"
+      mri &= "END\n"
+      writeFile("combine.mri", mri)
+      
+      let cmd = &"{arCommand} -M < combine.mri"
+      when defined(windows):
+        exec &"sh -c '{cmd}'"
+      else:
+        exec cmd
 
   # Replace the 8-bit only library with the combined one
-  exec "mv 8bit/libx265_combined.a 8bit/libx265.a"
+  movePath("8bit/libx265_combined.a", "8bit/libx265.a")
 
   # Install from 8bit build
   exec "cmake --install 8bit"
@@ -489,7 +553,7 @@ proc ffmpegSetup(crossWindows: bool) =
   mkDir("ffmpeg_sources")
   mkDir("build")
 
-  let buildPath = absolutePath("build")
+  let buildPath = toUnixPath(absolutePath("build"))
   let packages = setupPackages(enableWhisper=enableWhisper)
 
   withDir "ffmpeg_sources":
@@ -500,17 +564,19 @@ proc ffmpegSetup(crossWindows: bool) =
           exec &"curl -O -L {package.mirrorUrl}"
         else:
           exec &"curl -O -L {package.sourceUrl}"
-        checkHash(package, "ffmpeg_sources" / package.location)
+        checkHash(package, package.location)
 
       var tarArgs = "xf"
       if package.location.endsWith("bz2"):
         tarArgs = "xjf"
 
       if not dirExists(package.name):
-        exec &"tar {tarArgs} {package.location} && mv {package.dirName} {package.name}"
+        mkDir(package.name)
+        exec &"tar {tarArgs} {package.location} -C {package.name} --strip-components=1"
         let patchFile = &"../patches/{package.name}.patch"
         if fileExists(patchFile):
-          let cmd = &"patch -d {package.name} -i {absolutePath(patchFile)} -p1 --force"
+          let uPatchPath = toUnixPath(absolutePath(patchFile))
+          let cmd = &"patch -d {package.name} -i {uPatchPath} -p1 --force"
           echo "Applying patch: ", cmd
           exec cmd
 
@@ -527,7 +593,8 @@ proc ffmpegSetup(crossWindows: bool) =
         else:
           # Special handling for nv-codec-headers which doesn't use configure
           if package.name == "nv-codec-headers":
-            exec &"make install PREFIX=\"{buildPath}\""
+            let make = getMake()
+            exec &"{make} install PREFIX='{buildPath}'"
           else:
             if not fileExists("Makefile") or package.name == "x264":
               var args = package.buildArguments
@@ -538,11 +605,12 @@ proc ffmpegSetup(crossWindows: bool) =
                 else:
                   args.add("--host=x86_64-w64-mingw32")
                 envPrefix = "CC=x86_64-w64-mingw32-gcc-posix CXX=x86_64-w64-mingw32-g++-posix AR=x86_64-w64-mingw32-ar STRIP=x86_64-w64-mingw32-strip RANLIB=x86_64-w64-mingw32-ranlib "
-              if package.name != "x264":
-                args.add "--disable-shared"
               let cmd = &"{envPrefix}./configure --prefix=\"{buildPath}\" --enable-static " & args.join(" ")
               echo "RUN: ", cmd
-              exec cmd
+              when defined(windows):
+                exec &"sh -c '{cmd}'"
+              else:
+                exec cmd
             makeInstall()
 
 var filters: seq[string]
@@ -551,48 +619,53 @@ if enableWhisper:
 filters.add "scale,pad,format,gblur,aformat,abuffer,abuffersink,aresample,atempo,anull,anullsrc,volume,loudnorm,asetrate".split(",")
 
 proc setupCommonFlags(packages: seq[Package]): string =
-  var commonFlags = &"""
-    --enable-version3 \
-    --enable-static \
-    --disable-shared \
-    --disable-programs \
-    --disable-doc \
-    --disable-network \
-    --disable-indevs \
-    --disable-outdevs \
-    --disable-xlib \
-    --disable-bsfs \
-    --disable-protocols \
-    --enable-protocol=file \
-    --disable-filters \
-    --enable-filter={filters.join(",")} \
-    --disable-encoder={encodersDisabled} \
-    --disable-decoder={decodersDisabled} \
-    --disable-demuxer={demuxersDisabled} \
-    --disable-muxer={muxersDisabled} \
-  """
+  var flags = @[
+    "--enable-version3",
+    "--enable-static",
+    "--disable-shared",
+    "--disable-programs",
+    "--disable-doc",
+    "--disable-network",
+    "--disable-indevs",
+    "--disable-outdevs",
+    "--disable-xlib",
+    "--disable-bsfs",
+    "--disable-protocols",
+    "--enable-protocol=file",
+    "--disable-filters",
+    &"--enable-filter={filters.join(\",\")}",
+    &"--disable-encoder={encodersDisabled}",
+    &"--disable-decoder={decodersDisabled}",
+    &"--disable-demuxer={demuxersDisabled}",
+    &"--disable-muxer={muxersDisabled}"
+  ]
 
   for package in packages:
     if package.ffFlag != "":
-      commonFlags &= &"  {package.ffFlag} \\\n"
+      flags.add package.ffFlag
 
   if defined(arm) or defined(arm64):
-    commonFlags &= "  --enable-neon \\\n"
+    flags.add "--enable-neon"
 
   if defined(macosx):
-    commonFlags &= "  --enable-videotoolbox \\\n"
-    commonFlags &= "  --enable-audiotoolbox \\\n"
+    flags.add "--enable-videotoolbox"
+    flags.add "--enable-audiotoolbox"
   else:
-    commonFlags &= "  --enable-nvenc \\\n"
-    commonFlags &= "  --enable-ffnvcodec \\\n"
+    flags.add "--enable-nvenc"
+    flags.add "--enable-ffnvcodec"
 
-  commonFlags &= "--disable-autodetect"
-  return commonFlags
+  flags.add "--disable-autodetect"
+  return flags.join(" ")
 
 
 proc setupDeps() =
-  let (mesonOutput, mesonCode) = gorgeEx("command -v meson")
-  let (ninjaOutput, ninjaCode) = gorgeEx("command -v ninja")
+  # On Windows/MSYS2, automatic pip installation is unreliable.
+  # We check for existence and warn instead of crashing.
+  let (_, mesonCode) = gorgeEx("meson --version")
+  let (_, ninjaCode) = gorgeEx("ninja --version")
+  let (_, cmakeCode) = gorgeEx("cmake --version")
+  let (_, makeCode) = gorgeEx("make --version")
+  let (_, mwMakeCode) = gorgeEx("mingw32-make --version")
 
   var toInstall: seq[string] = @[]
 
@@ -600,24 +673,34 @@ proc setupDeps() =
     toInstall.add("meson")
   if ninjaCode != 0:
     toInstall.add("ninja")
+  if cmakeCode != 0:
+    toInstall.add("cmake")
+  if makeCode != 0 and mwMakeCode != 0:
+    toInstall.add("make")
 
   if toInstall.len > 0:
-    exec "pip install " & toInstall.join(" ")
+    when defined(windows):
+      echo "Warning: Missing dependencies: " & toInstall.join(", ")
+      echo "Please install them via pacman (on MSYS2) or pip (on Windows)."
+      echo "MSYS2: pacman -S mingw-w64-x86_64-meson mingw-w64-x86_64-ninja mingw-w64-x86_64-cmake make"
+    else:
+      exec "pip install " & toInstall.join(" ")
 
 task makeff, "Build FFmpeg from source":
   setupDeps()
-  let buildPath = absolutePath("build")
+  let buildPath = toUnixPath(absolutePath("build"))
   # Set PKG_CONFIG_PATH to include both standard and architecture-specific paths
-  var pkgConfigPaths = @[buildPath / "lib/pkgconfig"]
+  # Use POSIX separator ':' because we are running in MSYS2 environment
+  var pkgConfigPaths = @[buildPath & "/lib/pkgconfig"]
   when defined(linux):
-    when defined(arm64):
-      pkgConfigPaths.add(buildPath / "lib/aarch64-linux-gnu/pkgconfig")
+    if defined(arm64):
+      pkgConfigPaths.add(buildPath & "/lib/aarch64-linux-gnu/pkgconfig")
     else:
-      pkgConfigPaths.add(buildPath / "lib/x86_64-linux-gnu/pkgconfig")
-    pkgConfigPaths.add(buildPath / "lib64/pkgconfig")
+      pkgConfigPaths.add(buildPath & "/lib/x86_64-linux-gnu/pkgconfig")
+    pkgConfigPaths.add(buildPath & "/lib64/pkgconfig")
     # Add common cmake install paths for pkg-config files
-    pkgConfigPaths.add(buildPath / "lib/cmake")
-    pkgConfigPaths.add(buildPath / "share/pkgconfig")
+    pkgConfigPaths.add(buildPath & "/lib/cmake")
+    pkgConfigPaths.add(buildPath & "/share/pkgconfig")
   putEnv("PKG_CONFIG_PATH", pkgConfigPaths.join(":"))
 
   ffmpegSetup(crossWindows=false)
@@ -632,17 +715,18 @@ task makeff, "Build FFmpeg from source":
     exec "pkg-config --list-all | grep whisper || echo 'whisper not found in pkg-config'"
 
   withDir "ffmpeg_sources/ffmpeg":
-    exec &"""./configure --prefix="{buildPath}" \
-      --pkg-config-flags="--static" \
-      --extra-cflags="-I{buildPath}/include" \
-      --extra-ldflags="-L{buildPath}/lib" \
-      --extra-libs="-lpthread -lm" \""" & "\n" & setupCommonFlags(packages)
+    let confCmd = &"""./configure --prefix="{buildPath}" --pkg-config-flags="--static" --extra-cflags="-I{buildPath}/include" --extra-ldflags="-L{buildPath}/lib" --extra-libs="-lpthread -lm" """ & setupCommonFlags(packages)
+    echo "RUN: ", confCmd
+    when defined(windows):
+      exec &"sh -c '{confCmd}'"
+    else:
+      exec confCmd
     makeInstall()
 
 task makeffwin, "Build FFmpeg for Windows cross-compilation":
   setupDeps()
-  let buildPath = absolutePath("build")
-  putEnv("PKG_CONFIG_PATH", buildPath / "lib/pkgconfig")
+  let buildPath = toUnixPath(absolutePath("build"))
+  putEnv("PKG_CONFIG_PATH", buildPath & "/lib/pkgconfig")
 
   ffmpegSetup(crossWindows=true)
 
@@ -650,15 +734,12 @@ task makeffwin, "Build FFmpeg for Windows cross-compilation":
 
   # Configure and build FFmpeg with MinGW
   withDir "ffmpeg_sources/ffmpeg":
-    exec (&"""CC=x86_64-w64-mingw32-gcc-posix CXX=x86_64-w64-mingw32-g++-posix AR=x86_64-w64-mingw32-ar STRIP=x86_64-w64-mingw32-strip RANLIB=x86_64-w64-mingw32-ranlib PKG_CONFIG_PATH="{buildPath}/lib/pkgconfig" ./configure --prefix="{buildPath}" \
-      --pkg-config-flags="--static" \
-      --extra-cflags="-I{buildPath}/include" \
-      --extra-ldflags="-L{buildPath}/lib" \
-      --extra-libs="-lpthread -lm -lstdc++" \
-      --arch=x86_64 \
-      --target-os=mingw32 \
-      --cross-prefix=x86_64-w64-mingw32- \
-      --enable-cross-compile \""" & "\n" & setupCommonFlags(packages))
+    let confCmd = &"""CC=x86_64-w64-mingw32-gcc-posix CXX=x86_64-w64-mingw32-g++-posix AR=x86_64-w64-mingw32-ar STRIP=x86_64-w64-mingw32-strip RANLIB=x86_64-w64-mingw32-ranlib PKG_CONFIG_PATH="{buildPath}/lib/pkgconfig" ./configure --prefix="{buildPath}" --pkg-config-flags="--static" --extra-cflags="-I{buildPath}/include" --extra-ldflags="-L{buildPath}/lib" --extra-libs="-lpthread -lm -lstdc++" --arch=x86_64 --target-os=mingw32 --cross-prefix=x86_64-w64-mingw32- --enable-cross-compile """ & setupCommonFlags(packages)
+    echo "RUN: ", confCmd
+    when defined(windows):
+      exec &"sh -c '{confCmd}'"
+    else:
+      exec confCmd
     makeInstall()
 
 task windows, "Cross-compile to Windows (requires mingw-w64)":
