@@ -32,7 +32,9 @@ task test, "Run unit tests":
 task make, "Export the project":
   var extraFlags = ""
   when not defined(windows):
-    extraFlags = "--passC:-flto --passL:-flto "
+    # LTO is disabled by default on Linux/macOS to speed up builds in VMs.
+    # To enable: extraFlags = "--passC:-flto --passL:-flto "
+    extraFlags = ""
   else:
     extraFlags = "--passL:-static "
   exec &"nim c -d:danger --panics:on {flags} {extraFlags}--out:auto-editor src/main.nim"
@@ -245,9 +247,14 @@ proc getFileHash(filename: string): string =
 
     raise newException(IOError, "Cannot hash file: " & path & "\n" & output)
   else:
-    let (output, exitCode) = gorgeEx("shasum -a 256 " & filename)
+    var hashCmd = "shasum -a 256"
+    let (shaCheck, shaCheckCode) = gorgeEx("which shasum")
+    if shaCheckCode != 0:
+      hashCmd = "sha256sum"
+    
+    let (output, exitCode) = gorgeEx(hashCmd & " \"" & path & "\"")
     if exitCode != 0:
-      raise newException(IOError, "Cannot hash file: " & filename)
+      raise newException(IOError, "Cannot hash file: " & filename & " using " & hashCmd)
     return output.split()[0]
 
 proc checkHash(package: Package, filename: string) =
